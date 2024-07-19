@@ -51,14 +51,14 @@ enum Commands {
   Add { url: String },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Metadata {
   // posted: Option<DateTime<Utc>>,
   posted: Option<NaiveDateTime>,
   user: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Bookmark {
   href: String,
   meta: Metadata,
@@ -68,6 +68,24 @@ struct Bookmark {
 #[derive(Debug, Serialize, Deserialize)]
 struct Config {
   bookmarks: PathBuf,
+}
+
+fn write_bookmarks(bookmarks: &Vec<Bookmark>, output_file: &PathBuf) -> Result<()> {
+  let file = std::fs::File::create(output_file)?;
+  let mut writer = std::io::BufWriter::new(file);
+  serde_json::to_writer(&mut writer, &bookmarks)?;
+  Ok(())
+}
+
+fn dedup(bookmarks: &[Bookmark], output_file: &PathBuf) -> Result<Vec<Bookmark>> {
+  let mut new_bookmarks: Vec<Bookmark> = Vec::with_capacity(bookmarks.len());
+  for bookmark in bookmarks {
+    if let None = new_bookmarks.iter().find(|b| b.href == bookmark.href) {
+      new_bookmarks.push(bookmark.clone());
+    }
+  }
+  write_bookmarks(&new_bookmarks, output_file)?;
+  Ok(new_bookmarks)
 }
 
 fn add(bookmarks: &mut Vec<Bookmark>, url: &str, output_file: &PathBuf) -> Result<()> {
@@ -114,9 +132,7 @@ fn add(bookmarks: &mut Vec<Bookmark>, url: &str, output_file: &PathBuf) -> Resul
           },
         });
         // Write the bookmark file
-        let file = std::fs::File::create(output_file)?;
-        let mut writer = std::io::BufWriter::new(file);
-        serde_json::to_writer(&mut writer, &bookmarks)?;
+        write_bookmarks(bookmarks, output_file)?;
         println!("\radded {}", title);
         Ok(())
       } else {
@@ -193,6 +209,11 @@ fn main() -> Result<(), Box<dyn Error>> {
       }
     }
   };
+
+  let new_bookmarks = dedup(&bookmarks[..], &config.bookmarks)?;
+  if new_bookmarks.len() < bookmarks.len() {
+    println!("deduped {} entries", bookmarks.len() - new_bookmarks.len());
+  }
 
   match &opt.command {
     Some(Commands::Add { url }) => add(&mut bookmarks, &url, &config.bookmarks)?,
