@@ -13,3 +13,20 @@ scraper = "0.19.1"
 reqwest = { version = "0.12.5", features = ["blocking"] }
 anyhow = { version = "1.0.86", features = ["backtrace"] }
 users = "0.11.0"
+# So that we can compile with musl
+openssl = { version = "0.10.33", features = ["vendored"] }
+
+# Build with `cargo build --profile release-small
+[profile.release-small] # A profile to try to minimize the size
+inherits = "release"
+panic = "abort" # Abort on Panic
+strip = true
+opt-level = "z" # Optimize For Size
+lto = true # Enable Link Time Optimization (LTO)
+codegen-units = 1 # Reduce Parallel Code Generation Units to Increase Optimization
+
+# Build with `cargo build --profile release-small-with-debug
+[profile.release-small-with-debug]
+inherits = "release-small"
+strip = false
+debug = true
