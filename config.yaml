@@ -1,2 +1,8 @@
+# If not specified, bookmarks will use the file 'bookmarks.json'
 bookmarks: bookmarks.json
-
+# If specified, will use chromium to fetch html conntent otherwise  will rely
+# on a non-javascript client.
+chromium:
+  enabled: true
+  # If not specified, bookmarks will rely on the environment
+  # path: /snap/bin/chromium
