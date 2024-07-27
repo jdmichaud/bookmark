@@ -2,6 +2,7 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
+use serde::Deserializer;
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use clap::{Parser, Subcommand};
@@ -49,6 +50,10 @@ struct Opt {
 enum Commands {
   /// Adds a bookmark
   Add { url: String },
+  /// temporary
+  Fetch { urls: Vec<String> },
+  /// temporary
+  Hash { hash: String },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -61,11 +66,39 @@ struct Metadata {
   referer: Option<String>,
 }
 
+// This is the representation of Bookmark when serialize
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct Bookmark {
+struct BookmarkRepr {
   href: String,
   meta: Metadata,
   title: String,
+}
+
+// This is a bookmark with computed fields (hash)
+// as described in https://github.com/serde-rs/serde/issues/1689#issuecomment-653831474
+#[derive(Debug, Serialize, Clone)]
+struct Bookmark {
+  href: String,
+  #[serde(skip_serializing)]
+  hash: String,
+  meta: Metadata,
+  title: String,
+}
+
+// https://github.com/serde-rs/serde/issues/1689#issuecomment-653831474
+impl<'de> Deserialize<'de> for Bookmark {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+      D: Deserializer<'de>,
+  {
+    let bookmark = BookmarkRepr::deserialize(deserializer)?;
+    Ok(Bookmark {
+      hash: get_hash(&bookmark.href),
+      href: bookmark.href,
+      meta: bookmark.meta,
+      title: bookmark.title,
+    })
+  }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -97,10 +130,12 @@ fn dedup(bookmarks: &[Bookmark], output_file: &PathBuf) -> Result<Vec<Bookmark>>
     }
   }
   // Let sort the bookmarks by date while we're at it
-  new_bookmarks.sort_by(|a, b| if a.meta.posted.is_none() || b.meta.posted.is_none() {
-    a.href.cmp(&b.href)
-  } else {
-    a.meta.posted.unwrap().cmp(&b.meta.posted.unwrap())
+  new_bookmarks.sort_by(|a, b| {
+    if a.meta.posted.is_none() || b.meta.posted.is_none() {
+      a.href.cmp(&b.href)
+    } else {
+      a.meta.posted.unwrap().cmp(&b.meta.posted.unwrap())
+    }
   });
   write_bookmarks(&new_bookmarks, output_file)?;
   Ok(new_bookmarks)
@@ -127,10 +162,53 @@ fn fetch_http(config: &Config, url: &str) -> Result<String> {
   }
 }
 
+fn get_text(
+  config: &Config,
+  url: &str,
+) -> Result<String> {
+  let body = fetch_http(config, url)?;
+  let document = Html::parse_document(&body);
+  let selector = Selector::parse(r#"body :not(style)"#).unwrap();
+  let text_content = document.select(&selector).next().unwrap();
+  Ok(text_content.text().collect::<Vec<_>>().join(""))
+}
+
+
+// Prints the url from the hash
+fn hash2url(
+  config: &Config,
+  bookmarks: &mut Vec<Bookmark>,
+  hash: &str,
+  output_file: &PathBuf,
+) -> Result<()> {
+  if let Some(bookmark) = bookmarks.iter().find(|b| b.hash == hash) {
+    println!("{} ({})", bookmark.title, bookmark.href);
+  }
+  Ok(())
+}
+
+fn fetch(
+  config: &Config,
+  bookmarks: &mut Vec<Bookmark>,
+  urls: &[String],
+  output_file: &PathBuf,
+) -> Result<()> {
+  for url in urls {
+    println!("fetching {}...", url);
+    UrlStore::new(config)?.fetch_url(url)?;
+  }
+  Ok(())
+}
+
 // Adds a bookmark based on a URL
 // The function will treat hacker news stories differently as it will consider
 // them as referer and the article pointer to as the original submission.
-fn add(config: &Config, bookmarks: &mut Vec<Bookmark>, url: &str, output_file: &PathBuf) -> Result<()> {
+fn add(
+  config: &Config,
+  bookmarks: &mut Vec<Bookmark>,
+  url: &str,
+  output_file: &PathBuf,
+) -> Result<()> {
   fn get_hn_article(config: &Config, url: &str) -> Result<(String, scraper::Html)> {
     let body = fetch_http(config, url)?;
     let hn_document = Html::parse_document(&body);
@@ -180,6 +258,7 @@ fn add(config: &Config, bookmarks: &mut Vec<Bookmark>, url: &str, output_file: &
         let user = get_user_by_uid(get_current_uid()).unwrap();
         // Create the new bookmark and add it to the list
         bookmarks.push(Bookmark {
+          hash: get_hash(&article_url),
           href: article_url,
           title: title.to_string(),
           meta: Metadata {
@@ -225,31 +304,45 @@ fn get_state_folder() -> Result<PathBuf> {
   return Ok(path);
 }
 
-struct UrlStore {
+struct UrlStore<'a> {
   data_folder: PathBuf,
+  config: &'a Config,
 }
 
-impl UrlStore {
-  fn new() -> Result<Self> {
+fn get_hash(key: &str) -> String {
+  use base32::Alphabet;
+  use sha1::{Digest, Sha1};
+
+  let mut hasher = Sha1::new();
+  hasher.update(key);
+  let hash = hasher.finalize();
+  base32::encode(Alphabet::Crockford, &hash)
+}
+
+impl<'a> UrlStore<'a> {
+  fn new(config: &'a Config) -> Result<Self> {
     Ok(UrlStore {
       data_folder: get_data_folder()?,
+      config: config,
     })
   }
 
-  fn get_hash(key: &str) -> String {
-    use sha1::{Sha1, Digest};
-    use base64ct::{Base64, Encoding};
-
-    let mut hasher = Sha1::new();
-    hasher.update(key);
-    let hash = hasher.finalize();
-    Base64::encode_string(&hash)
+  pub fn fetch_url(self: &Self, url: &str) -> Result<String> {
+    let hash = get_hash(url);
+    let mut hashpath = self.data_folder.clone();
+    hashpath.push(&(hash + ".html"));
+    // Check the presence of the content of the url in the data folder
+    let content = std::fs::read_to_string(&hashpath)
+      .or_else(|_| {
+        let content = fetch_http(self.config, url)?;
+        match std::fs::write(&hashpath, &content) {
+          Ok(_) => {},
+          Err(e) => anyhow::bail!("error writing to {} ({})", &hashpath.to_string_lossy(), e),
+        }
+        Ok::<std::string::String, anyhow::Error>(content)
+      })?;
+    Ok(content)
   }
-
-  // pub fn get_url(url: &str) -> Result<String> {
-  //   let content = fetch_http(url)?;
-  //   let hash = get_hash(url);
-  // }
 }
 
 // Checks if chromium is available in headless mode with the dump-dom option.
@@ -260,7 +353,9 @@ fn chromium_available(config: &Config) -> bool {
   // First check if chromium is enabled in the config and if yes, is a path is
   // provided
   let chromium_path = if let Some(chromium_config) = &config.chromium {
-    if !chromium_config.enabled { return false; }
+    if !chromium_config.enabled {
+      return false;
+    }
     if let Some(chromium_path) = &chromium_config.path {
       &chromium_path
     } else {
@@ -285,11 +380,18 @@ fn chromium_available(config: &Config) -> bool {
 
   let available = match std::process::Command::new(chromium_path)
     .args(["--headless", "--dump-dom", "www.google.com"])
-    .output() {
-    Ok(output) => if output.status.success() { true } else { false },
+    .output()
+  {
+    Ok(output) => {
+      if output.status.success() {
+        true
+      } else {
+        false
+      }
+    }
     Err(_) => false,
   };
-  // Recorde the chromium state in a file
+  // Record the chromium state in a file
   if let Ok(mut state_folder) = get_state_folder() {
     state_folder.push("chromium_available");
     if let Ok(mut state_file) = std::fs::File::create(state_folder) {
@@ -297,23 +399,31 @@ fn chromium_available(config: &Config) -> bool {
     }
   }
   return available;
-
 }
 
 // Fetches the page through chromium so that javascript can be interpreted if needed.
 // Returns the resulting HTML content.
 // ⚠️ This relies on undocumented chromium features
 fn fetch_by_chromium(url: &str) -> Result<String> {
+  if url.ends_with(".pdf") {
+    anyhow::bail!("chromium is not able to download pdf");
+  }
   let output = std::process::Command::new("chromium")
     .args(["--headless", "--dump-dom", url])
     .output()
     .expect("could not spawn chromium");
-  Ok(String::from_utf8(output.stdout)?)
+  let content = String::from_utf8(output.stdout)?;
+  // That's how chromium tells you he's unhappy
+  if content.starts_with(r#"<html><head><script>start("/");</script>"#) {
+    anyhow::bail!("could not load {}", url)
+  }
+  Ok(content)
 }
 
 fn main() -> Result<()> {
-  let default_config_file_path: String =
-    env::var("XDG_CONFIG_HOME").unwrap_or(env::var("HOME")? + "/.config/") + "/bookmark/config.yaml";
+  let default_config_file_path: String = env::var("XDG_CONFIG_HOME")
+    .unwrap_or(env::var("HOME")? + "/.config/")
+    + "/bookmark/config.yaml";
 
   let opt = Opt::parse();
   // Load the config. We first check if a config file was provided as an option
@@ -332,6 +442,8 @@ fn main() -> Result<()> {
       // Try to load it
       match std::fs::read_to_string(&default_config_file_path) {
         Err(e) => {
+          // We should be able to load a config from somewhere, if we fail just
+          // stops execution
           eprintln!("error: {e}: {}", default_config_file_path);
           std::process::exit(1);
         }
@@ -360,6 +472,7 @@ fn main() -> Result<()> {
       Ok(inputfile) => inputfile,
       Err(e) => {
         eprintln!("{}: {}", config.bookmarks.display(), e);
+        eprintln!("you must provide a bookmark file");
         std::process::exit(1);
       }
     };
@@ -381,9 +494,11 @@ fn main() -> Result<()> {
     println!("deduped {} entries", bookmarks.len() - new_bookmarks.len());
     bookmarks = new_bookmarks;
   }
-
+  // We treat the commands here
   match &opt.command {
     Some(Commands::Add { url }) => add(&config, &mut bookmarks, &url, &config.bookmarks)?,
+    Some(Commands::Fetch { urls }) => fetch(&config, &mut bookmarks, &urls, &config.bookmarks)?,
+    Some(Commands::Hash { hash }) => hash2url(&config, &mut bookmarks, &hash, &config.bookmarks)?,
     None => {
       // By default, just lists the bookmarks
       for i in 0..bookmarks.len() {
