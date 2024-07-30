@@ -1,3 +1,4 @@
+// echo [] > test.json && cargo run -- --bookmarks test.json add https://news.ycombinator.com/item?id=41074703
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(unused_imports)]
@@ -273,7 +274,8 @@ fn add(
         });
         // Write the bookmark file
         write_bookmarks(bookmarks, output_file)?;
-        println!("\radded {}", title);
+        print!("\radded {}", title);
+        println!("\x1b[0K");
         Ok(())
       } else {
         Err(anyhow::anyhow!(
