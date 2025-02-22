@@ -58,6 +58,7 @@ def compute(argv):
   futures = [executor.submit(compute_embeddings, filename) for filename in argv]
   concurrent.futures.wait(futures)
 
+# python3 embeddings.py search 'rust zig' ~/.local/share/bookmark/*.embeddings
 def search(argv):
   if (len(argv) < 3):
     print("expecting at least 3 arguments")

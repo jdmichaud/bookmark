@@ -3,12 +3,12 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
-use serde::Deserializer;
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use clap::{Parser, Subcommand};
 use reqwest;
 use scraper::{Html, Selector};
+use serde::Deserializer;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::error::Error;
@@ -53,7 +53,7 @@ enum Commands {
   Add { url: String },
   /// temporary
   Fetch { urls: Vec<String> },
-  /// temporary
+  /// Print the url associated with the provided hash if present in the bookmark file
   Hash { hash: String },
 }
 
@@ -90,7 +90,7 @@ struct Bookmark {
 impl<'de> Deserialize<'de> for Bookmark {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
   where
-      D: Deserializer<'de>,
+    D: Deserializer<'de>,
   {
     let bookmark = BookmarkRepr::deserialize(deserializer)?;
     Ok(Bookmark {
@@ -110,7 +110,15 @@ struct ChromiumConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Config {
+  // Where to load the bookmark file.
+  // Default is ~/bookmarks.json
   bookmarks: PathBuf,
+  // Keep a local copy of the article
+  // Kept in XDG_DATA_HOME
+  // default: false
+  store_articles: Option<bool>,
+  // The config used to launch chromium to retrieve the page content including
+  // with javascript enabled.
   chromium: Option<ChromiumConfig>,
 }
 
@@ -163,10 +171,7 @@ fn fetch_http(config: &Config, url: &str) -> Result<String> {
   }
 }
 
-fn get_text(
-  config: &Config,
-  url: &str,
-) -> Result<String> {
+fn get_text(config: &Config, url: &str) -> Result<String> {
   let body = fetch_http(config, url)?;
   let document = Html::parse_document(&body);
   let selector = Selector::parse(r#"body :not(style)"#).unwrap();
@@ -174,136 +179,18 @@ fn get_text(
   Ok(text_content.text().collect::<Vec<_>>().join(""))
 }
 
-
 // Prints the url from the hash
 fn hash2url(
   config: &Config,
   bookmarks: &mut Vec<Bookmark>,
   hash: &str,
-  output_file: &PathBuf,
 ) -> Result<()> {
   if let Some(bookmark) = bookmarks.iter().find(|b| b.hash == hash) {
     println!("{} ({})", bookmark.title, bookmark.href);
-  }
-  Ok(())
-}
-
-fn fetch(
-  config: &Config,
-  bookmarks: &mut Vec<Bookmark>,
-  urls: &[String],
-  output_file: &PathBuf,
-) -> Result<()> {
-  for url in urls {
-    println!("fetching {}...", url);
-    UrlStore::new(config)?.fetch_url(url)?;
-  }
-  Ok(())
-}
-
-// Adds a bookmark based on a URL
-// The function will treat hacker news stories differently as it will consider
-// them as referer and the article pointer to as the original submission.
-fn add(
-  config: &Config,
-  bookmarks: &mut Vec<Bookmark>,
-  url: &str,
-  output_file: &PathBuf,
-) -> Result<()> {
-  fn get_hn_article(config: &Config, url: &str) -> Result<(String, scraper::Html)> {
-    let body = fetch_http(config, url)?;
-    let hn_document = Html::parse_document(&body);
-    let selector = Selector::parse(r#".titleline > a"#).unwrap();
-    if let Some(title_line_element) = hn_document.select(&selector).next() {
-      if let Some(article_url) = title_line_element.value().attr("href") {
-        let article_body = fetch_http(config, article_url)?;
-        Ok((article_url.to_string(), Html::parse_document(&article_body)))
-      } else {
-        Err(anyhow::anyhow!(
-          "could not retrieve the article link from the hacker news post"
-        ))
-      }
-    } else {
-      Err(anyhow::anyhow!(
-        "could not get the article title from the hacker news post"
-      ))
-    }
-  }
-
-  // Check the url is not already present
-  if let Some(result) = bookmarks.iter().find(|b| b.href == *url) {
-    eprint!(
-      "warning: this url is already present in bookmarks: {}",
-      result.title
-    );
-    if let Some(date) = result.meta.posted {
-      eprint!(" added the {}", date);
-    }
-    eprintln!("");
-    Ok(())
   } else {
-    print!("fetching {}... ", url);
-    let _ = std::io::stdout().flush();
-    // If the url if from an hacker new post, fetch the original article
-    let is_hacker_news = url.contains("news.ycombinator.com/item?id=");
-    let (article_url, document) = if is_hacker_news {
-      get_hn_article(config, url)?
-    } else {
-      let body = fetch_http(config, url)?;
-      (url.to_string(), Html::parse_document(&body))
-    };
-    let selector = Selector::parse(r#"title"#).unwrap();
-    // Get the title
-    if let Some(title_element) = document.select(&selector).next() {
-      if let Some(title) = title_element.text().next() {
-        let user = get_user_by_uid(get_current_uid()).unwrap();
-        // Create the new bookmark and add it to the list
-        bookmarks.push(Bookmark {
-          hash: get_hash(&article_url),
-          href: article_url,
-          title: title.to_string(),
-          meta: Metadata {
-            posted: Some(chrono::offset::Utc::now().naive_utc()),
-            user: Some(user.name().to_string_lossy().to_string()),
-            referer: if is_hacker_news {
-              Some(url.to_string())
-            } else {
-              None
-            },
-          },
-        });
-        // Write the bookmark file
-        write_bookmarks(bookmarks, output_file)?;
-        print!("\radded {}", title);
-        println!("\x1b[0K");
-        Ok(())
-      } else {
-        Err(anyhow::anyhow!(
-          "could not retrieve text from title in the html page"
-        ))
-      }
-    } else {
-      Err(anyhow::anyhow!(
-        "could not retrieve title from the html page"
-      ))
-    }
+    eprintln!("hash not found {}", hash);
   }
-}
-
-fn get_data_folder() -> Result<PathBuf> {
-  let default_config_data_path: String =
-    env::var("XDG_DATA_HOME").unwrap_or(env::var("HOME")? + "/.local/share") + "/bookmark/";
-  std::fs::create_dir_all(&default_config_data_path)?;
-  let path = std::path::PathBuf::from(&default_config_data_path);
-  return Ok(path);
-}
-
-fn get_state_folder() -> Result<PathBuf> {
-  let default_config_state_path: String =
-    env::var("XDG_STATE_HOME").unwrap_or(env::var("HOME")? + "/.local/state") + "/bookmark/";
-  std::fs::create_dir_all(&default_config_state_path)?;
-  let path = std::path::PathBuf::from(&default_config_state_path);
-  return Ok(path);
+  Ok(())
 }
 
 struct UrlStore<'a> {
@@ -334,17 +221,145 @@ impl<'a> UrlStore<'a> {
     let mut hashpath = self.data_folder.clone();
     hashpath.push(&(hash + ".html"));
     // Check the presence of the content of the url in the data folder
-    let content = std::fs::read_to_string(&hashpath)
-      .or_else(|_| {
-        let content = fetch_http(self.config, url)?;
+    let content = std::fs::read_to_string(&hashpath).or_else(|_| {
+      let content = fetch_http(self.config, url)?;
+      if self.config.store_articles.unwrap_or(false) {
+        // Save the content in a file in the data folder
         match std::fs::write(&hashpath, &content) {
-          Ok(_) => {},
+          Ok(_) => {}
           Err(e) => anyhow::bail!("error writing to {} ({})", &hashpath.to_string_lossy(), e),
         }
-        Ok::<std::string::String, anyhow::Error>(content)
-      })?;
+      }
+      Ok::<std::string::String, anyhow::Error>(content)
+    })?;
     Ok(content)
   }
+}
+
+fn fetch_urls(
+  url_store: &UrlStore,
+  urls: &[String],
+) -> Result<()> {
+  for url in urls {
+    println!("fetching {}...", url);
+    url_store.fetch_url(&url)?;
+  }
+  Ok(())
+}
+
+fn get_hn_article(config: &Config, url: &str) -> Result<(String, scraper::Html)> {
+  let body = fetch_http(config, url)?;
+  let hn_document = Html::parse_document(&body);
+  let selector = Selector::parse(r#".titleline > a"#).unwrap();
+  if let Some(title_line_element) = hn_document.select(&selector).next() {
+    if let Some(article_url) = title_line_element.value().attr("href") {
+      let article_body = fetch_http(config, article_url)?;
+      Ok((article_url.to_string(), Html::parse_document(&article_body)))
+    } else {
+      Err(anyhow::anyhow!(
+        "could not retrieve the article link from the hacker news post"
+      ))
+    }
+  } else {
+    Err(anyhow::anyhow!(
+      "could not get the article title from the hacker news post"
+    ))
+  }
+}
+
+// Fetch the url (of in case of an HN article the original article) and return
+// the article url and the title
+fn fetch_article(config: &Config, url: &str) -> Result<(String, String)> {
+  let _ = std::io::stdout().flush();
+  // If the url if from an hacker new post, fetch the original article
+  let is_hacker_news = url.contains("news.ycombinator.com/item?id=");
+  let (article_url, document) = if is_hacker_news {
+    get_hn_article(config, url)?
+  } else {
+    let body = fetch_http(config, url)?;
+    (url.to_string(), Html::parse_document(&body))
+  };
+  let selector = Selector::parse(r#"title"#).unwrap();
+  // Get the title
+  if let Some(title_element) = document.select(&selector).next() {
+    if let Some(title) = title_element.text().next() {
+      Ok((article_url, title.to_string()))
+    } else {
+      Err(anyhow::anyhow!(
+        "could not retrieve text from title in the html page"
+      ))
+    }
+  } else {
+    Err(anyhow::anyhow!(
+      "could not retrieve title from the html page"
+    ))
+  }
+}
+
+// Adds a bookmark based on a URL
+// The function will treat hacker news stories differently as it will consider
+// them as referer and the article pointer to as the original submission.
+fn add(
+  config: &Config,
+  bookmarks: &mut Vec<Bookmark>,
+  url: &str,
+) -> Result<()> {
+  // Check the url is not already present
+  if let Some(result) = bookmarks.iter().find(|b| b.href == *url) {
+    eprint!(
+      "warning: this url is already present in bookmarks: {}",
+      result.title
+    );
+    if let Some(date) = result.meta.posted {
+      eprint!(" added the {}", date);
+    }
+    eprintln!("");
+  } else {
+    print!("fetching {}... ", url);
+    // The article url will be different from the url if the url is from
+    // Hacker News. We will bookmark the article url and only keep the url
+    // as a referer
+    let (article_url, title) = fetch_article(&config, &url)?;
+    let is_hacker_news = url != article_url;
+    let user = get_user_by_uid(get_current_uid()).unwrap();
+    // Create the new bookmark and add it to the list
+    bookmarks.push(Bookmark {
+      hash: get_hash(&article_url),
+      href: article_url,
+      title: title.to_string(),
+      meta: Metadata {
+        posted: Some(chrono::offset::Utc::now().naive_utc()),
+        user: Some(user.name().to_string_lossy().to_string()),
+        referer: if is_hacker_news {
+          Some(url.to_string())
+        } else {
+          None
+        },
+      },
+    });
+    // Write the bookmark file
+    write_bookmarks(bookmarks, &config.bookmarks)?;
+
+    print!("\radded {}", title);
+    println!("\x1b[0K");
+  }
+  Ok(())
+}
+
+fn get_data_folder() -> Result<PathBuf> {
+  let default_config_data_path: String =
+    env::var("XDG_DATA_HOME").unwrap_or(env::var("HOME")? + "/.local/share") + "/bookmark/";
+  std::fs::create_dir_all(&default_config_data_path)?;
+  let path = std::path::PathBuf::from(&default_config_data_path);
+  return Ok(path);
+}
+
+fn get_state_folder() -> Result<PathBuf> {
+  let default_config_state_path: String =
+    env::var("XDG_STATE_HOME").unwrap_or(env::var("HOME")? + "/.local/state") + "/bookmark/";
+  std::fs::create_dir_all(&default_config_state_path)?;
+  let path = std::path::PathBuf::from(&default_config_state_path);
+  return Ok(path);
 }
 
 // Checks if chromium is available in headless mode with the dump-dom option.
@@ -468,24 +483,35 @@ fn main() -> Result<()> {
     config.bookmarks = std::path::PathBuf::from(&bookmarks);
   }
 
-  // Load the bookmark files
+  // Load the bookmark files or create it if it does not exists
   let mut bookmarks: Vec<Bookmark> = {
-    let inputfile = match std::fs::File::open(&config.bookmarks) {
+    let inputfile = match std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .open(&config.bookmarks) {
       Ok(inputfile) => inputfile,
       Err(e) => {
         eprintln!("{}: {}", config.bookmarks.display(), e);
-        eprintln!("you must provide a bookmark file");
         std::process::exit(1);
       }
     };
-    match serde_json::from_reader(std::io::BufReader::new(inputfile)) {
-      Ok(json) => json,
+    match inputfile.metadata() {
+      // serde does not accpet empty files
+      Ok(metadata) if metadata.len() == 0 => vec![],
+      Ok(metadata) => match serde_json::from_reader(std::io::BufReader::new(inputfile)) {
+        Ok(json) => json,
+        Err(e) => {
+          eprintln!(
+            "{}: could not parse json file: {}",
+            config.bookmarks.display(),
+            e
+          );
+          std::process::exit(1);
+        }
+      }
       Err(e) => {
-        eprintln!(
-          "{}: could not parse json file: {}",
-          config.bookmarks.display(),
-          e
-        );
+        eprintln!("{}: {}", config.bookmarks.display(), e);
         std::process::exit(1);
       }
     }
@@ -496,11 +522,13 @@ fn main() -> Result<()> {
     println!("deduped {} entries", bookmarks.len() - new_bookmarks.len());
     bookmarks = new_bookmarks;
   }
+  // The object used to retrieve the content of bookmark
+  let url_store = UrlStore::new(&config)?;
   // We treat the commands here
   match &opt.command {
-    Some(Commands::Add { url }) => add(&config, &mut bookmarks, &url, &config.bookmarks)?,
-    Some(Commands::Fetch { urls }) => fetch(&config, &mut bookmarks, &urls, &config.bookmarks)?,
-    Some(Commands::Hash { hash }) => hash2url(&config, &mut bookmarks, &hash, &config.bookmarks)?,
+    Some(Commands::Add { url }) => add(&config, &mut bookmarks, &url)?,
+    Some(Commands::Fetch { urls }) => fetch_urls(&url_store, &urls)?,
+    Some(Commands::Hash { hash }) => hash2url(&config, &mut bookmarks, &hash)?,
     None => {
       // By default, just lists the bookmarks
       for i in 0..bookmarks.len() {
