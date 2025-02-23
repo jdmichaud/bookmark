@@ -60,12 +60,13 @@ def compute(argv):
 
 # python3 embeddings.py search 'rust zig' ~/.local/share/bookmark/*.embeddings
 def search(argv):
-  if (len(argv) < 3):
-    print("expecting at least 3 arguments")
+  if (len(argv) < 2):
+    print("expecting at least 2 arguments")
     sys.exit(1)
 
   needle, files = argv[0], argv[1:]
   needle_embeddings = compute_embeddings_string(needle)
+  print('needle_embeddings', needle_embeddings)
 
   embeddings = dict()
   for filename in files:

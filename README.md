@@ -34,3 +34,10 @@ Arguments:
 Options:
   -h, --help  Print help
 ```
+
+#### Build
+
+You need to musl development tools (for a static build) and protbuf compiler (for candle-onnx):
+```bash
+apt install musl-dev musl-tools
+```

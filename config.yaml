@@ -2,6 +2,9 @@
 bookmarks: bookmarks.json
 # Keep a local copy of the article in XDG_DATA_HOME
 store_articles: true
+# Enable search function.
+# Also enabled store_articles function.
+search: true
 # If specified, will use chromium to fetch html conntent otherwise  will rely
 # on a non-javascript client.
 chromium:

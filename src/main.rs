@@ -3,7 +3,7 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
-use anyhow::{Context, Result};
+use anyhow::{Error as E, Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use clap::{Parser, Subcommand};
 use reqwest;
@@ -51,6 +51,8 @@ struct Opt {
 enum Commands {
   /// Adds a bookmark
   Add { url: String },
+  /// Search the needle among the articles
+  Search { needle: Vec<String> },
   /// temporary
   Fetch { urls: Vec<String> },
   /// Print the url associated with the provided hash if present in the bookmark file
@@ -117,6 +119,10 @@ struct Config {
   // Kept in XDG_DATA_HOME
   // default: false
   store_articles: Option<bool>,
+  // Enable search feature.
+  // Implicitly turn on store_articles feature.
+  // default: false
+  search: Option<bool>,
   // The config used to launch chromium to retrieve the page content including
   // with javascript enabled.
   chromium: Option<ChromiumConfig>,
@@ -182,7 +188,7 @@ fn get_text(config: &Config, url: &str) -> Result<String> {
 // Prints the url from the hash
 fn hash2url(
   config: &Config,
-  bookmarks: &mut Vec<Bookmark>,
+  bookmarks: &Vec<Bookmark>,
   hash: &str,
 ) -> Result<()> {
   if let Some(bookmark) = bookmarks.iter().find(|b| b.hash == hash) {
@@ -219,15 +225,31 @@ impl<'a> UrlStore<'a> {
   pub fn fetch_url(self: &Self, url: &str) -> Result<String> {
     let hash = get_hash(url);
     let mut hashpath = self.data_folder.clone();
-    hashpath.push(&(hash + ".html"));
+    hashpath.push(&(hash.clone() + ".html"));
+    println!("look for {}", hashpath.display());
     // Check the presence of the content of the url in the data folder
     let content = std::fs::read_to_string(&hashpath).or_else(|_| {
       let content = fetch_http(self.config, url)?;
-      if self.config.store_articles.unwrap_or(false) {
+      let search_enabled = self.config.search.unwrap_or(false);
+      if self.config.store_articles.unwrap_or(false) || search_enabled {
         // Save the content in a file in the data folder
         match std::fs::write(&hashpath, &content) {
-          Ok(_) => {}
+          Ok(_) => println!("{} saved", hashpath.display()),
           Err(e) => anyhow::bail!("error writing to {} ({})", &hashpath.to_string_lossy(), e),
+        }
+        if search_enabled {
+          // Compute the embeddings of the file
+          // FIXME: get rid of unwrap
+          let embeddings = compute_embeddings(&content).unwrap();
+          // Convert to an array of f32
+          let array: Vec<f32> = embeddings.to_vec1()?;
+          // Create the embedding file path
+          let mut embedding_path = self.data_folder.clone();
+          embedding_path.push(&(hash + ".html.embeddings"));
+          // Serialize the array to the file
+          let file = std::fs::File::create(embedding_path)?;
+          let mut writer = std::io::BufWriter::new(file);
+          serde_json::to_writer(&mut writer, &array)?;
         }
       }
       Ok::<std::string::String, anyhow::Error>(content)
@@ -247,13 +269,13 @@ fn fetch_urls(
   Ok(())
 }
 
-fn get_hn_article(config: &Config, url: &str) -> Result<(String, scraper::Html)> {
-  let body = fetch_http(config, url)?;
+fn get_hn_article(url_store: &UrlStore, url: &str) -> Result<(String, scraper::Html)> {
+  let body = url_store.fetch_url(url)?;
   let hn_document = Html::parse_document(&body);
   let selector = Selector::parse(r#".titleline > a"#).unwrap();
   if let Some(title_line_element) = hn_document.select(&selector).next() {
     if let Some(article_url) = title_line_element.value().attr("href") {
-      let article_body = fetch_http(config, article_url)?;
+      let article_body = url_store.fetch_url(article_url)?;
       Ok((article_url.to_string(), Html::parse_document(&article_body)))
     } else {
       Err(anyhow::anyhow!(
@@ -269,14 +291,14 @@ fn get_hn_article(config: &Config, url: &str) -> Result<(String, scraper::Html)>
 
 // Fetch the url (of in case of an HN article the original article) and return
 // the article url and the title
-fn fetch_article(config: &Config, url: &str) -> Result<(String, String)> {
+fn fetch_article(url_store: &UrlStore, url: &str) -> Result<(String, String)> {
   let _ = std::io::stdout().flush();
   // If the url if from an hacker new post, fetch the original article
   let is_hacker_news = url.contains("news.ycombinator.com/item?id=");
   let (article_url, document) = if is_hacker_news {
-    get_hn_article(config, url)?
+    get_hn_article(url_store, url)?
   } else {
-    let body = fetch_http(config, url)?;
+    let body = url_store.fetch_url(url)?;
     (url.to_string(), Html::parse_document(&body))
   };
   let selector = Selector::parse(r#"title"#).unwrap();
@@ -301,6 +323,7 @@ fn fetch_article(config: &Config, url: &str) -> Result<(String, String)> {
 // them as referer and the article pointer to as the original submission.
 fn add(
   config: &Config,
+  url_store: &UrlStore,
   bookmarks: &mut Vec<Bookmark>,
   url: &str,
 ) -> Result<()> {
@@ -319,7 +342,7 @@ fn add(
     // The article url will be different from the url if the url is from
     // Hacker News. We will bookmark the article url and only keep the url
     // as a referer
-    let (article_url, title) = fetch_article(&config, &url)?;
+    let (article_url, title) = fetch_article(&url_store, &url)?;
     let is_hacker_news = url != article_url;
     let user = get_user_by_uid(get_current_uid()).unwrap();
     // Create the new bookmark and add it to the list
@@ -437,7 +460,105 @@ fn fetch_by_chromium(url: &str) -> Result<String> {
   Ok(content)
 }
 
-fn main() -> Result<()> {
+use candle_core::{Device, Tensor};
+
+// from https://github.com/huggingface/candle/blob/26c16923b92bddda6b05ee1993af47fb6de6ebd7/candle-examples/examples/bert/main.rs
+fn compute_embeddings(content: &str) -> Result<Tensor, Box<dyn Error + Send + Sync>> {
+  use candle_nn::VarBuilder;
+  use candle_transformers::models::bert::{BertModel, Config, DTYPE};
+  use tokenizers::Tokenizer;
+
+  let device = &Device::Cpu;
+  let mut tokenizer_builder = Tokenizer::from_file("./all-MiniLM-L6-v2/tokenizer.json")?;
+  let config = std::fs::read_to_string("./all-MiniLM-L6-v2/config.json")?;
+  let config: Config = serde_json::from_str(&config)?;
+  let vb = VarBuilder::from_pth("./all-MiniLM-L6-v2/pytorch_model.bin", DTYPE, device)?;
+  let model = BertModel::load(vb, &config)?;
+  // let start = std::time::Instant::now();
+  let tokenizer = tokenizer_builder
+    .with_padding(None)
+    .with_truncation(None)
+    .map_err(E::msg)?;
+  let tokens = tokenizer
+    .encode(content, true)
+    .map_err(E::msg)?
+    .get_ids()
+    .to_vec();
+
+  let token_ids = Tensor::new(tokens.as_slice(), device)?.unsqueeze(0)?;
+  let token_type_ids = token_ids.zeros_like()?;
+  // println!("Loaded and encoded {:?}", start.elapsed());
+
+  // let start = std::time::Instant::now();
+  let embeddings = model.forward(&token_ids, &token_type_ids, None)?;
+  // This will give as an embedding per token so we apply some avg-pooling by
+  // taking the mean embedding value for all tokens (including padding)
+  let (_n_sentence, n_tokens, _hidden_size) = embeddings.dims3()?;
+  let embeddings = (embeddings.sum(1)? / (n_tokens as f64))?;
+    // from dimension [1, 384] to [384]
+  let embeddings = embeddings.squeeze(0)?;
+  // println!("Took {:?}", start.elapsed());
+
+  Ok(embeddings)
+}
+
+fn similarity(e_i: Tensor, e_j: Tensor) -> Result<f32> {
+  let sum_ij = (&e_i * &e_j)?.sum_all()?.to_scalar::<f32>()?;
+  let sum_i2 = (&e_i * &e_i)?.sum_all()?.to_scalar::<f32>()?;
+  let sum_j2 = (&e_j * &e_j)?.sum_all()?.to_scalar::<f32>()?;
+  let cosine_similarity = sum_ij / (sum_i2 * sum_j2).sqrt();
+  return Ok(cosine_similarity);
+}
+
+// reference: https://www.reddit.com/r/rust/comments/1hyfex8/comment/m6kce24/
+fn search(config: &Config, bookmarks: &Vec<Bookmark>, needle: &Vec<String>) -> Result<(), Box<dyn Error + Send + Sync>> {
+  let needle = needle.join(" ");
+
+  let needle_embeddings = compute_embeddings(&needle)?;
+  // println!(">{needle_embeddings}");
+
+  // Retrieve all the path in the data folder that ends with .embeddings
+  let embedding_paths = std::fs::read_dir(get_data_folder()?)?
+    .filter(|r| r.is_ok()) // Get rid of Err variants for Result<DirEntry>
+    .map(|r| r.unwrap()) // This is safe, since we only have the Ok variants
+    .filter(|dir_entry| {
+      if let Ok(file_type) = dir_entry.file_type() {
+        file_type.is_file()
+      } else { false }
+    })
+    .filter(|dir_entry| {
+      if let Some(extension) = dir_entry.path().extension() {
+        extension == "embeddings"
+      } else { false }
+    })
+    .map(|dir_entry| dir_entry.path());
+
+  let mut similarities = embedding_paths
+    .map(|embedding_path| {
+      let inputfile = std::fs::File::open(&embedding_path)?;
+      let article_embeddings: Vec<f32> = serde_json::from_reader(inputfile)?;
+      let length = article_embeddings.len();
+      let article_embeddings = Tensor::from_vec(article_embeddings, length, &Device::Cpu)?;
+      let similarity = similarity(needle_embeddings.clone(), article_embeddings)?;
+      Ok::<(f32, PathBuf), E>((similarity, embedding_path))
+    })
+    .filter(|r| r.is_ok()) // Get rid of Err variants for Result<DirEntry>
+    .map(|r| r.unwrap()) // This is safe, since we only have the Ok variants
+    .collect::<Vec<_>>();
+  similarities.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+
+  for entry in similarities.iter().take(5) {
+    let embedding_path = &entry.1;
+    let hash = embedding_path.file_stem().unwrap();
+    if let Some(bookmark) = bookmarks.iter().find(|b| hash.to_str().unwrap().starts_with(&b.hash)) {
+      println!("{} {}", entry.0, bookmark.href);
+    }
+  }
+
+  Ok(())
+}
+
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
   let default_config_file_path: String = env::var("XDG_CONFIG_HOME")
     .unwrap_or(env::var("HOME")? + "/.config/")
     + "/bookmark/config.yaml";
@@ -526,9 +647,10 @@ fn main() -> Result<()> {
   let url_store = UrlStore::new(&config)?;
   // We treat the commands here
   match &opt.command {
-    Some(Commands::Add { url }) => add(&config, &mut bookmarks, &url)?,
+    Some(Commands::Add { url }) => add(&config, &url_store, &mut bookmarks, &url)?,
     Some(Commands::Fetch { urls }) => fetch_urls(&url_store, &urls)?,
-    Some(Commands::Hash { hash }) => hash2url(&config, &mut bookmarks, &hash)?,
+    Some(Commands::Hash { hash }) => hash2url(&config, &bookmarks, &hash)?,
+    Some(Commands::Search { needle }) => search(&config, &bookmarks, &needle)?,
     None => {
       // By default, just lists the bookmarks
       for i in 0..bookmarks.len() {

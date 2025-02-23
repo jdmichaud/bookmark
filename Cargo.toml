@@ -1,6 +1,6 @@
 [package]
 name = "bookmark"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -13,6 +13,12 @@ scraper = "0.19.1"
 reqwest = { version = "0.12.5", features = ["blocking"] }
 anyhow = { version = "1.0.86", features = ["backtrace"] }
 users = "0.11.0"
+# Removing the default feature `esaxx_fast` which requires musl-g++ which the
+# ubuntu package musl-dev does not install.
+tokenizers = { version = "0.21.0", default-features=false, features = ["progressbar", "indicatif", "onig"]}
+candle-core = "0.8.3"
+candle-nn = "0.8.3"
+candle-transformers = "0.8.3"
 # So that we can compile with musl
 openssl = { version = "0.10.33", features = ["vendored"] }
 sha1 = "0.10.6"
