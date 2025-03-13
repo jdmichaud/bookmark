@@ -53,10 +53,10 @@ enum Commands {
   Add { url: String },
   /// Search the needle among the articles
   Search { needle: Vec<String> },
-  /// temporary
-  Fetch { urls: Vec<String> },
   /// Print the url associated with the provided hash if present in the bookmark file
   Hash { hash: String },
+  /// Check the index
+  Check { },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -222,11 +222,28 @@ impl<'a> UrlStore<'a> {
     })
   }
 
-  pub fn fetch_url(self: &Self, url: &str) -> Result<String> {
+  fn url_to_path(self: &Self, url: &str) -> PathBuf {
     let hash = get_hash(url);
     let mut hashpath = self.data_folder.clone();
     hashpath.push(&(hash.clone() + ".html"));
-    println!("look for {}", hashpath.display());
+    return hashpath;
+  }
+
+  // Check if the url is already present in the store
+  pub fn has(self: &Self, url: &str) -> bool {
+    let hashpath = self.url_to_path(url);
+    return hashpath.exists();
+  }
+
+  // Fetch the content from the internet whatever the store status
+  pub fn fetch_url(self: &Self, url: &str) -> Result<String> {
+    fetch_http(self.config, url)
+  }
+
+  // Will check if the article is in the store, fetch the article otherwise
+  // store it if configured so add a search index if configured so.
+  pub fn fetch_article(self: &Self, url: &str) -> Result<String> {
+    let hashpath = self.url_to_path(url);
     // Check the presence of the content of the url in the data folder
     let content = std::fs::read_to_string(&hashpath).or_else(|_| {
       let content = fetch_http(self.config, url)?;
@@ -234,7 +251,7 @@ impl<'a> UrlStore<'a> {
       if self.config.store_articles.unwrap_or(false) || search_enabled {
         // Save the content in a file in the data folder
         match std::fs::write(&hashpath, &content) {
-          Ok(_) => println!("{} saved", hashpath.display()),
+          Ok(_) => println!("{} saved", url),
           Err(e) => anyhow::bail!("error writing to {} ({})", &hashpath.to_string_lossy(), e),
         }
         if search_enabled {
@@ -245,7 +262,7 @@ impl<'a> UrlStore<'a> {
           let array: Vec<f32> = embeddings.to_vec1()?;
           // Create the embedding file path
           let mut embedding_path = self.data_folder.clone();
-          embedding_path.push(&(hash + ".html.embeddings"));
+          embedding_path.push(&(get_hash(url) + ".html.embeddings"));
           // Serialize the array to the file
           let file = std::fs::File::create(embedding_path)?;
           let mut writer = std::io::BufWriter::new(file);
@@ -258,24 +275,13 @@ impl<'a> UrlStore<'a> {
   }
 }
 
-fn fetch_urls(
-  url_store: &UrlStore,
-  urls: &[String],
-) -> Result<()> {
-  for url in urls {
-    println!("fetching {}...", url);
-    url_store.fetch_url(&url)?;
-  }
-  Ok(())
-}
-
 fn get_hn_article(url_store: &UrlStore, url: &str) -> Result<(String, scraper::Html)> {
   let body = url_store.fetch_url(url)?;
   let hn_document = Html::parse_document(&body);
   let selector = Selector::parse(r#".titleline > a"#).unwrap();
   if let Some(title_line_element) = hn_document.select(&selector).next() {
     if let Some(article_url) = title_line_element.value().attr("href") {
-      let article_body = url_store.fetch_url(article_url)?;
+      let article_body = url_store.fetch_article(article_url)?;
       Ok((article_url.to_string(), Html::parse_document(&article_body)))
     } else {
       Err(anyhow::anyhow!(
@@ -298,7 +304,7 @@ fn fetch_article(url_store: &UrlStore, url: &str) -> Result<(String, String)> {
   let (article_url, document) = if is_hacker_news {
     get_hn_article(url_store, url)?
   } else {
-    let body = url_store.fetch_url(url)?;
+    let body = url_store.fetch_article(url)?;
     (url.to_string(), Html::parse_document(&body))
   };
   let selector = Selector::parse(r#"title"#).unwrap();
@@ -558,6 +564,22 @@ fn search(config: &Config, bookmarks: &Vec<Bookmark>, needle: &Vec<String>) -> R
   Ok(())
 }
 
+// Go through the article and check their respect the configuration
+fn check_fetch(url_store: &UrlStore, bookmarks: &Vec<Bookmark>) -> Result<(), Box<dyn Error + Send + Sync>> {
+  let mut warn = false;
+  for bookmark in bookmarks {
+    if !url_store.has(&bookmark.href) {
+      if !warn {
+        warn = true;
+        // println!("some articles are missing from the local disks, please wait while they are being fetched...");
+      }
+      // Some url cannot be downloaded for now (pdf). Ignore the errors...
+      _ = url_store.fetch_article(&bookmark.href);
+    }
+  }
+  Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
   let default_config_file_path: String = env::var("XDG_CONFIG_HOME")
     .unwrap_or(env::var("HOME")? + "/.config/")
@@ -643,13 +665,16 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("deduped {} entries", bookmarks.len() - new_bookmarks.len());
     bookmarks = new_bookmarks;
   }
-  // The object used to retrieve the content of bookmark
   let url_store = UrlStore::new(&config)?;
+  if config.store_articles.unwrap_or(false) || config.search.unwrap_or(false) {
+    check_fetch(&url_store, &bookmarks)?;
+  }
+  // The object used to retrieve the content of bookmark
   // We treat the commands here
   match &opt.command {
     Some(Commands::Add { url }) => add(&config, &url_store, &mut bookmarks, &url)?,
-    Some(Commands::Fetch { urls }) => fetch_urls(&url_store, &urls)?,
     Some(Commands::Hash { hash }) => hash2url(&config, &bookmarks, &hash)?,
+    Some(Commands::Check {}) => (),
     Some(Commands::Search { needle }) => search(&config, &bookmarks, &needle)?,
     None => {
       // By default, just lists the bookmarks
