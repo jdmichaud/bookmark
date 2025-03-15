@@ -348,14 +348,22 @@ fn add(
     // The article url will be different from the url if the url is from
     // Hacker News. We will bookmark the article url and only keep the url
     // as a referer
-    let (article_url, title) = fetch_article(&url_store, &url)?;
-    let is_hacker_news = url != article_url;
+    let mut is_hacker_news = false;
+    let mut article_url = url.to_string();
+    let mut title = "".to_string();
+    if let Ok((new_article_url, fetched_title)) = fetch_article(&url_store, &url) {
+      is_hacker_news = url != article_url;
+      article_url = new_article_url;
+      title = fetched_title;
+    } else {
+      eprintln!("warning: could not fetch {}", article_url);
+    }
     let user = get_user_by_uid(get_current_uid()).unwrap();
     // Create the new bookmark and add it to the list
     bookmarks.push(Bookmark {
       hash: get_hash(&article_url),
-      href: article_url,
-      title: title.to_string(),
+      href: article_url.clone(),
+      title: title.clone(),
       meta: Metadata {
         posted: Some(chrono::offset::Utc::now().naive_utc()),
         user: Some(user.name().to_string_lossy().to_string()),
@@ -369,7 +377,7 @@ fn add(
     // Write the bookmark file
     write_bookmarks(bookmarks, &config.bookmarks)?;
 
-    print!("\radded {}", title);
+    print!("\radded {}", if title != "" { title } else { article_url });
     println!("\x1b[0K");
   }
   Ok(())
