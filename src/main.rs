@@ -281,7 +281,12 @@ fn get_hn_article(url_store: &UrlStore, url: &str) -> Result<(String, scraper::H
   let selector = Selector::parse(r#".titleline > a"#).unwrap();
   if let Some(title_line_element) = hn_document.select(&selector).next() {
     if let Some(article_url) = title_line_element.value().attr("href") {
-      let article_body = url_store.fetch_article(article_url)?;
+      let mut article_url = String::from(article_url);
+      if article_url.starts_with("item") {
+        // This is an internal HN article, we need to prepend HN domain
+        article_url = "https://news.ycombinator.com/".to_owned() + &article_url;
+      }
+      let article_body = url_store.fetch_article(&article_url)?;
       Ok((article_url.to_string(), Html::parse_document(&article_body)))
     } else {
       Err(anyhow::anyhow!(
