@@ -40,6 +40,14 @@ Search a bookmark using vector embeddings of the bookmark content.
 bookmark search a natural query that can contain several words
 ```
 
+### check
+
+Check that urls are fetched and indexed if configured so.
+
+```
+bookmark check
+```
+
 ## Config
 
 `bookmark` use a config from either:

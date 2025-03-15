@@ -229,9 +229,20 @@ impl<'a> UrlStore<'a> {
     return hashpath;
   }
 
+  fn url_to_embeddings_path(self: &Self, url: &str) -> PathBuf {
+    let mut embedding_path = self.data_folder.clone();
+    embedding_path.push(&(get_hash(url) + ".html.embeddings"));
+    return embedding_path;
+  }
+
   // Check if the url is already present in the store
   pub fn has(self: &Self, url: &str) -> bool {
     let hashpath = self.url_to_path(url);
+    return hashpath.exists();
+  }
+
+  pub fn has_embeddings(self: &Self, url: &str) -> bool {
+    let hashpath = self.url_to_embeddings_path(url);
     return hashpath.exists();
   }
 
@@ -244,34 +255,37 @@ impl<'a> UrlStore<'a> {
   // store it if configured so add a search index if configured so.
   pub fn fetch_article(self: &Self, url: &str) -> Result<String> {
     let hashpath = self.url_to_path(url);
+    let search_enabled = self.config.search.unwrap_or(false);
     // Check the presence of the content of the url in the data folder
     let content = std::fs::read_to_string(&hashpath).or_else(|_| {
       let content = fetch_http(self.config, url)?;
-      let search_enabled = self.config.search.unwrap_or(false);
       if self.config.store_articles.unwrap_or(false) || search_enabled {
         // Save the content in a file in the data folder
         match std::fs::write(&hashpath, &content) {
           Ok(_) => println!("{} saved", url),
           Err(e) => anyhow::bail!("error writing to {} ({})", &hashpath.to_string_lossy(), e),
         }
-        if search_enabled {
-          // Compute the embeddings of the file
-          // FIXME: get rid of unwrap
-          let embeddings = compute_embeddings(&content).unwrap();
-          // Convert to an array of f32
-          let array: Vec<f32> = embeddings.to_vec1()?;
-          // Create the embedding file path
-          let mut embedding_path = self.data_folder.clone();
-          embedding_path.push(&(get_hash(url) + ".html.embeddings"));
-          // Serialize the array to the file
-          let file = std::fs::File::create(embedding_path)?;
-          let mut writer = std::io::BufWriter::new(file);
-          serde_json::to_writer(&mut writer, &array)?;
-        }
       }
       Ok::<std::string::String, anyhow::Error>(content)
     })?;
     Ok(content)
+  }
+
+  pub fn compute_embeddings(self: &Self, url: &str, content: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Create the embedding file path
+    let embedding_path = self.url_to_embeddings_path(url);
+    if !embedding_path.exists() {
+      // Compute the embeddings of the file
+      // FIXME: get rid of unwrap
+      let embeddings = compute_embeddings(&content)?;
+      // Convert to an array of f32
+      let array: Vec<f32> = embeddings.to_vec1()?;
+      // Serialize the array to the file
+      let file = std::fs::File::create(embedding_path)?;
+      let mut writer = std::io::BufWriter::new(file);
+      serde_json::to_writer(&mut writer, &array)?;
+    }
+    Ok(())
   }
 }
 
@@ -578,16 +592,39 @@ fn search(config: &Config, bookmarks: &Vec<Bookmark>, needle: &Vec<String>) -> R
 }
 
 // Go through the article and check their respect the configuration
-fn check_fetch(url_store: &UrlStore, bookmarks: &Vec<Bookmark>) -> Result<(), Box<dyn Error + Send + Sync>> {
+fn check_fetch(config: &Config, url_store: &UrlStore, bookmarks: &Vec<Bookmark>) -> Result<(), Box<dyn Error + Send + Sync>> {
   let mut warn = false;
   for bookmark in bookmarks {
     if !url_store.has(&bookmark.href) {
       if !warn {
         warn = true;
-        // println!("some articles are missing from the local disks, please wait while they are being fetched...");
+        println!("some articles are missing from the local disks, please wait while they are being fetched...");
       }
-      // Some url cannot be downloaded for now (pdf). Ignore the errors...
-      _ = url_store.fetch_article(&bookmark.href);
+      match url_store.fetch_article(&bookmark.href) {
+        Err(e) => eprintln!("error: could not fetch {} ({})", bookmark.href, e),
+        _ => (),
+      }
+    }
+  }
+  Ok(())
+}
+
+fn check_embeddings(config: &Config, url_store: &UrlStore, bookmarks: &Vec<Bookmark>) -> Result<(), Box<dyn Error + Send + Sync>> {
+  let mut warn = false;
+  for bookmark in bookmarks {
+    if !url_store.has_embeddings(&bookmark.href) {
+      if !warn {
+        warn = true;
+        println!("some articles are missing from the search index, please wait while they are being indexed...");
+      }
+      if config.search.unwrap_or(false) {
+        if let Ok(content) = url_store.fetch_article(&bookmark.href) {
+          match url_store.compute_embeddings(&bookmark.href, &content) {
+            Err(e) => eprintln!("error: could not index {} ({})", bookmark.href, e),
+            _ => (),
+          }
+        }
+      }
     }
   }
   Ok(())
@@ -679,16 +716,26 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     bookmarks = new_bookmarks;
   }
   let url_store = UrlStore::new(&config)?;
-  if config.store_articles.unwrap_or(false) || config.search.unwrap_or(false) {
-    check_fetch(&url_store, &bookmarks)?;
-  }
   // The object used to retrieve the content of bookmark
   // We treat the commands here
   match &opt.command {
     Some(Commands::Add { url }) => add(&config, &url_store, &mut bookmarks, &url)?,
     Some(Commands::Hash { hash }) => hash2url(&config, &bookmarks, &hash)?,
-    Some(Commands::Check {}) => (),
-    Some(Commands::Search { needle }) => search(&config, &bookmarks, &needle)?,
+    Some(Commands::Check {}) => {
+      if config.store_articles.unwrap_or(false) || config.search.unwrap_or(false) {
+        check_fetch(&config, &url_store, &bookmarks)?;
+      }
+      if config.search.unwrap_or(false) {
+        check_embeddings(&config, &url_store, &bookmarks)?;
+      }
+    },
+    Some(Commands::Search { needle }) => {
+      if !config.search.unwrap_or(false) {
+        eprintln!("Search feature is not enabled. Edit your configuration and 'search: true'.");
+        return Ok(());
+      }
+      search(&config, &bookmarks, &needle)?
+    }
     None => {
       // By default, just lists the bookmarks
       for i in 0..bookmarks.len() {
